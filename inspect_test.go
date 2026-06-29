@@ -53,7 +53,7 @@ func Test_matchesSelector(t *testing.T) {
 		{
 			thanosLabels: map[string]string{"label": "value"},
 			selectorLabels: labels.Labels{
-				{"label", "value"},
+				{Name: "label", Value: "value"},
 			},
 			res: true,
 		},
@@ -64,8 +64,8 @@ func Test_matchesSelector(t *testing.T) {
 				"label3 ": "value3 ",
 			},
 			selectorLabels: labels.Labels{
-				{"label", "*"},
-				{"label3 ", "value3 "},
+				{Name: "label", Value: "*"},
+				{Name: "label3 ", Value: "value3 "},
 			},
 			res: true,
 		},
@@ -75,8 +75,8 @@ func Test_matchesSelector(t *testing.T) {
 				"label2": "value2",
 			},
 			selectorLabels: labels.Labels{
-				{"label", "value"},
-				{"label3 ", "value3 "},
+				{Name: "label", Value: "value"},
+				{Name: "label3 ", Value: "value3 "},
 			},
 			res: false,
 		},
