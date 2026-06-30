@@ -32,7 +32,7 @@ import (
 
 const metaExtLabels = "__meta_ext_labels"
 
-func unwrap(bkt objstore.Bucket, unwrapRelabel extkingpin.PathOrContent, unwrapMetaRelabel extkingpin.PathOrContent, recursive bool, dir *string, wait *time.Duration, unwrapDry bool, outConfig *extkingpin.PathOrContent, maxTime *model.TimeOrDurationValue, unwrapSrc *string, maxOpen int, logger log.Logger) (err error) {
+func unwrap(bkt objstore.Bucket, unwrapRelabel extkingpin.PathOrContent, unwrapMetaRelabel extkingpin.PathOrContent, recursive bool, dir *string, wait *time.Duration, unwrapDry bool, outConfig *extkingpin.PathOrContent, maxTime *model.TimeOrDurationValue, unwrapSrc *string, maxOpen int, stream bool, logger log.Logger) (err error) {
 	relabelContentYaml, err := unwrapRelabel.Content()
 	if err != nil {
 		return fmt.Errorf("get content of relabel configuration: %w", err)
@@ -80,7 +80,7 @@ func unwrap(bkt objstore.Bucket, unwrapRelabel extkingpin.PathOrContent, unwrapM
 					continue
 				}
 			}
-			if err := unwrapBlock(bkt, b, relabelConfig, metaRelabel, *dir, unwrapDry, dst, maxOpen, logger); err != nil {
+			if err := unwrapBlock(bkt, b, relabelConfig, metaRelabel, *dir, unwrapDry, dst, maxOpen, stream, logger); err != nil {
 				return err
 			}
 		}
@@ -98,7 +98,7 @@ func unwrap(bkt objstore.Bucket, unwrapRelabel extkingpin.PathOrContent, unwrapM
 	})
 }
 
-func unwrapBlock(bkt objstore.Bucket, b Block, relabelConfig []*relabel.Config, metaRelabel []*relabel.Config, dir string, unwrapDry bool, dst objstore.Bucket, maxOpen int, logger log.Logger) (err error) {
+func unwrapBlock(bkt objstore.Bucket, b Block, relabelConfig []*relabel.Config, metaRelabel []*relabel.Config, dir string, unwrapDry bool, dst objstore.Bucket, maxOpen int, stream bool, logger log.Logger) (err error) {
 	if err := runutil.DeleteAll(dir); err != nil {
 		return fmt.Errorf("unable to cleanup cache folder %s: %w", dir, err)
 	}
@@ -134,18 +134,6 @@ func unwrapBlock(bkt objstore.Bucket, b Block, relabelConfig []*relabel.Config, 
 		return nil
 	}
 	origMeta.Thanos.Labels = lbls.Map()
-	db, err := tsdb.OpenDBReadOnly(inDir, logger)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		err = tsdb_errors.NewMulti(err, db.Close()).Err()
-	}()
-	q, err := db.Querier(context.Background(), 0, math.MaxInt64)
-	if err != nil {
-		return err
-	}
-	defer q.Close()
 
 	// split into one block per ext-label tenant (writes their Thanos meta.json too)
 	os.Mkdir(outDir, 0777)
@@ -153,9 +141,39 @@ func unwrapBlock(bkt objstore.Bucket, b Block, relabelConfig []*relabel.Config, 
 	// yields them in label order, not time order) and across periodic commits, so the
 	// chunk range must dwarf the source span to avoid out-of-bounds/too-old rejects.
 	duration := getCompatibleBlockDuration(math.MaxInt64)
-	blocks, err := splitBlock(context.Background(), q, relabelConfig, outDir, *origMeta, duration, maxOpen, logger)
-	if err != nil {
-		return err
+	var blocks []ulid.ULID
+	if stream {
+		// Experimental: copy chunks straight from the source block (no in-memory
+		// Head), so peak memory is O(largest single series) instead of O(largest
+		// tenant). Reuses LeveledCompactor via a per-tenant block view.
+		blk, berr := tsdb.OpenBlock(logger, path.Join(inDir, b.Id.String()), chunkenc.NewPool())
+		if berr != nil {
+			return berr
+		}
+		blocks, err = streamSplitBlock(context.Background(), blk, relabelConfig, outDir, *origMeta, duration, logger)
+		if cerr := blk.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			return err
+		}
+	} else {
+		db, derr := tsdb.OpenDBReadOnly(inDir, logger)
+		if derr != nil {
+			return derr
+		}
+		defer func() {
+			err = tsdb_errors.NewMulti(err, db.Close()).Err()
+		}()
+		q, qerr := db.Querier(context.Background(), 0, math.MaxInt64)
+		if qerr != nil {
+			return qerr
+		}
+		defer q.Close()
+		blocks, err = splitBlock(context.Background(), q, relabelConfig, outDir, *origMeta, duration, maxOpen, logger)
+		if err != nil {
+			return err
+		}
 	}
 
 	if unwrapDry {
