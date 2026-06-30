@@ -370,6 +370,63 @@ func sameSummaries(a, b map[string]*tenantSum) bool {
 	return true
 }
 
+// TestStreamMatchesHead is the differential oracle for the streaming (no-Head)
+// writer: on the same source block it must produce per-tenant output identical to
+// the Head path - same blocks, series, sample counts and isolated ext-labels.
+func TestStreamMatchesHead(t *testing.T) {
+	logger := log.NewNopLogger()
+	inDir := path.Join(t.TempDir(), "in")
+	id := buildSourceBlock(t, inDir)
+	cfg := testRelabel(t)
+	origMeta := metadata.Meta{Thanos: metadata.Thanos{
+		Labels:     map[string]string{"src": "orig"},
+		Downsample: metadata.ThanosDownsample{Resolution: testResolution},
+	}}
+	duration := getCompatibleBlockDuration(math.MaxInt64)
+
+	headOut := path.Join(t.TempDir(), "head")
+	if err := os.MkdirAll(headOut, 0777); err != nil {
+		t.Fatal(err)
+	}
+	q, closeQ := openSourceQuerier(t, inDir)
+	headIDs, err := splitBlock(context.Background(), q, cfg, headOut, origMeta, duration, 1, logger)
+	closeQ()
+	if err != nil {
+		t.Fatalf("splitBlock: %v", err)
+	}
+
+	streamOut := path.Join(t.TempDir(), "stream")
+	if err := os.MkdirAll(streamOut, 0777); err != nil {
+		t.Fatal(err)
+	}
+	blk, err := tsdb.OpenBlock(logger, path.Join(inDir, id.String()), chunkenc.NewPool())
+	if err != nil {
+		t.Fatalf("open block: %v", err)
+	}
+	streamIDs, err := streamSplitBlock(context.Background(), blk, cfg, streamOut, origMeta, duration, logger)
+	blk.Close()
+	if err != nil {
+		t.Fatalf("streamSplitBlock: %v", err)
+	}
+
+	if len(streamIDs) != len(headIDs) {
+		t.Fatalf("stream produced %d blocks, head %d", len(streamIDs), len(headIDs))
+	}
+	head := summarize(t, headOut, headIDs)
+	stream := summarize(t, streamOut, streamIDs)
+	if !sameSummaries(head, stream) {
+		t.Errorf("stream output differs from Head:\n head:   %v\n stream: %v", head, stream)
+	}
+	// value-level spot check: the 6000-float series and the transition series must
+	// be byte-faithful through the chunk copy.
+	if got := strings.Join(drainSeries(t, streamOut, streamIDs, `{prometheus="F"}`, `{__name__="disk"}`), ","); got != "f@0=1,f@1=2,h@2,h@3" {
+		t.Errorf("stream F transition = %q", got)
+	}
+	if n := len(drainSeries(t, streamOut, streamIDs, `{prometheus="D"}`, `{__name__="disk"}`)); n != 6000 {
+		t.Errorf("stream D samples = %d want 6000", n)
+	}
+}
+
 // TestUnwrapBlockE2E covers unwrapBlock orchestration around splitBlock: the
 // dry-run guard, the (data-destructive) unconditional source delete, the
 // zero-output-block delete, and the meta-relabel whole-block drop.
@@ -435,7 +492,7 @@ func TestUnwrapBlockE2E(t *testing.T) {
 		defer restore()
 		src, id, srcDir := setupSrc(t)
 		dst, dstDir := dstBucket(t)
-		if err := unwrapBlock(src, Block{Id: id}, testRelabel(t), nil, t.TempDir(), false, dst, 1, logger); err != nil {
+		if err := unwrapBlock(src, Block{Id: id}, testRelabel(t), nil, t.TempDir(), false, dst, 1, false, logger); err != nil {
 			t.Fatalf("unwrapBlock: %v", err)
 		}
 		if got := countBlocks(dstDir); got != 6 {
@@ -450,7 +507,7 @@ func TestUnwrapBlockE2E(t *testing.T) {
 		defer restore()
 		src, id, srcDir := setupSrc(t)
 		dst, dstDir := dstBucket(t)
-		if err := unwrapBlock(src, Block{Id: id}, testRelabel(t), nil, t.TempDir(), true, dst, 1, logger); err != nil {
+		if err := unwrapBlock(src, Block{Id: id}, testRelabel(t), nil, t.TempDir(), true, dst, 1, false, logger); err != nil {
 			t.Fatalf("unwrapBlock: %v", err)
 		}
 		if got := countBlocks(dstDir); got != 0 {
@@ -466,7 +523,7 @@ func TestUnwrapBlockE2E(t *testing.T) {
 		src, id, srcDir := setupSrc(t)
 		dst, dstDir := dstBucket(t)
 		dropAll := mustRelabel(t, "- source_labels: [__name__]\n  regex: \".*\"\n  action: drop\n")
-		if err := unwrapBlock(src, Block{Id: id}, dropAll, nil, t.TempDir(), false, dst, 1, logger); err != nil {
+		if err := unwrapBlock(src, Block{Id: id}, dropAll, nil, t.TempDir(), false, dst, 1, false, logger); err != nil {
 			t.Fatalf("unwrapBlock: %v", err)
 		}
 		if got := countBlocks(dstDir); got != 0 {
@@ -484,7 +541,7 @@ func TestUnwrapBlockE2E(t *testing.T) {
 		// meta-relabel that drops the block: keep only blocks whose src label matches
 		// something the source's src="orig" does not.
 		metaDrop := mustRelabel(t, "- source_labels: [src]\n  regex: \"nomatch\"\n  action: keep\n")
-		if err := unwrapBlock(src, Block{Id: id}, testRelabel(t), metaDrop, t.TempDir(), false, dst, 1, logger); err != nil {
+		if err := unwrapBlock(src, Block{Id: id}, testRelabel(t), metaDrop, t.TempDir(), false, dst, 1, false, logger); err != nil {
 			t.Fatalf("unwrapBlock: %v", err)
 		}
 		if got := countBlocks(dstDir); got != 0 {
