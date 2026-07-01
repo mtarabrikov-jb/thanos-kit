@@ -119,8 +119,13 @@ source block, not heap - check `HeapSys` in `memstats-peak.txt` (or the bench
 ## Inspecting the output blocks (metrics & symbols)
 
 After `--dry-run` the per-tenant output blocks are left in
-`<data-dir>/out/<ULID>/` (upload/delete are skipped). Point a FILESYSTEM bucket
-at that dir to inspect them with the normal thanos-kit commands:
+`<data-dir>/out/<ULID>/` (upload/delete are skipped).
+
+For a one-shot check run `tests/check-output-blocks.sh <blocks-dir>` - it prints
+inspect + symdump + lossless totals (block / series / sample counts, to compare
+against the source) in one command; add `--dump 'MATCHER'` to also print sample
+series, and set `TK=/path/to/thanos-kit` to reuse a prebuilt binary. The
+individual commands it wraps, via a FILESYSTEM bucket pointed at the blocks dir:
 
 ```sh
 cat > /tmp/out-fs.yml <<'EOF'
