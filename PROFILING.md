@@ -116,6 +116,58 @@ source block, not heap - check `HeapSys` in `memstats-peak.txt` (or the bench
   them) is real disk, not tmpfs. The tool no longer pins `TMPDIR`; export it
   yourself if `/tmp` is tmpfs.
 
+## Inspecting the output blocks (metrics & symbols)
+
+After `--dry-run` the per-tenant output blocks are left in
+`<data-dir>/out/<ULID>/` (upload/delete are skipped). Point a FILESYSTEM bucket
+at that dir to inspect them with the normal thanos-kit commands:
+
+```sh
+cat > /tmp/out-fs.yml <<'EOF'
+type: FILESYSTEM
+config:
+  directory: /tmp/tkproc/out
+EOF
+```
+
+- **Blocks overview** - ULID, time range, level/resolution, #samples, #chunks,
+  ext-labels, source:
+  ```sh
+  ./thanos-kit inspect -r --objstore.config-file=/tmp/out-fs.yml
+  ```
+- **Metrics (series + samples)** - promtext (`{labels} value ts`), filtered with
+  `--match`:
+  ```sh
+  ./thanos-kit dump <ULID> --objstore.config-file=/tmp/out-fs.yml \
+    --data-dir=/tmp/dumpcache --match='{__name__="up"}'
+  ```
+- **Label cardinality / split candidates** for one block:
+  ```sh
+  ./thanos-kit analyze <ULID> --objstore.config-file=/tmp/out-fs.yml
+  ```
+
+### Symbol table (bloat check)
+
+`dump` / `analyze` only ever show *referenced* labels, so they cannot reveal
+symbol-table bloat (strings in the table that no series points at).
+`tools/symdump` reads the raw symbol table and reports referenced vs
+unreferenced:
+
+```sh
+go run ./tools/symdump /tmp/tkproc/out/*/
+```
+
+```
+series=585849 symbols=22472 referenced=22471 unreferenced_bloat=1
+```
+
+A `--stream` block should report `unreferenced_bloat=0`. A Head-path block
+reports `unreferenced_bloat=1` - that one is the empty string `""` (the Head
+always interns it and no series references it; harmless). Real bloat is
+hundreds/thousands of foreign strings (other tenants' label values, stripped
+ext-labels, dropped `__` labels) - exactly what the pruned `--stream` `Symbols()`
+override avoids, and what `symdump` would list under `bloat:` if it regressed.
+
 ## Clean up
 
 The profiler is opt-in via the build tag and env, so nothing needs reverting in
