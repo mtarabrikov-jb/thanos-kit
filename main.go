@@ -12,7 +12,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"runtime/debug"
 	"strconv"
 )
 
@@ -21,7 +20,6 @@ func main() {
 	app.HelpFlag.Short('h')
 	logLevel := app.Flag("log.level", "Log filtering level (info, debug)").Default("info").Enum("error", "warn", "info", "debug")
 	objStoreConfig := extkingpin.RegisterPathOrContent(app, "objstore.config", "YAML file that contains object store configuration. See format details: https://thanos.io/tip/thanos/storage.md/ ", extkingpin.WithEnvSubstitution(), extkingpin.WithRequired())
-	memLimit := app.Flag("memory-limit", "Soft memory limit for the Go runtime (e.g. 3GiB). Makes GC run harder so peak RSS stays near the live heap; for unwrap this roughly halves peak memory at some CPU cost. 0 = unset (the GOMEMLIMIT env var also works).").Default("0").Bytes()
 
 	lsCmd := app.Command("ls", "List all blocks in the bucket.")
 	lsRecursive := lsCmd.Flag("recursive", "Recurive search for blocks in the  bucket (Mimir has blocks nested to tenants folders)").Short('r').Default("false").Bool()
@@ -69,13 +67,10 @@ func main() {
 	unwrapMaxTime := model.TimeOrDuration(unwrapCmd.Flag("max-time", "End of time range limit to get blocks. Unwrap only those, which happened earlier than this value. Option can be a constant time in RFC3339 format or time duration relative to current time, such as -1d or 2h45m. Valid duration units are ms, s, m, h, d, w, y.").
 		Default("9999-12-31T23:59:59Z"))
 	unwrapSrc := unwrapCmd.Flag("source", "Only process blocks produced by this source (e.g `compactor`). Empty means process all blocks").Default("").String()
-	unwrapMaxOpen := unwrapCmd.Flag("max-open-blocks", "Number of ext-label tenants processed per pass over the source block (= max output blocks open in memory at once). Each tenant yields exactly one block. Lower => lower peak RAM but more full passes over the source; 1 = one tenant per pass (minimal RAM); 0 = all tenants in a single pass (peak RAM ~ unbounded). Ignored with --stream.").Default("1").Int()
+	unwrapMaxOpen := unwrapCmd.Flag("max-open-blocks", "Number of ext-label tenants processed per pass over the source block (= max output blocks open in memory at once). Each tenant yields exactly one block. Lower => lower peak RAM but more full passes over the source; 1 = one tenant per pass (minimal RAM); 0 (default, current behaviour) = all tenants in a single pass (peak RAM ~ unbounded). Ignored with --stream.").Default("0").Int()
 	unwrapStream := unwrapCmd.Flag("stream", "Experimental: write output blocks by streaming chunks straight from the source block (no in-memory Head), so peak memory is O(largest single series) instead of O(largest tenant), and source chunks are copied verbatim. Reuses the compactor; only ext-label-stripping relabel is supported (a relabel that reorders kept labels is rejected). Default uses the Head path.").Default("false").Bool()
 
 	cmd := kingpin.MustParse(app.Parse(os.Args[1:]))
-	if *memLimit > 0 {
-		debug.SetMemoryLimit(int64(*memLimit))
-	}
 	var logger log.Logger
 	{
 		lvl := level.AllowInfo()

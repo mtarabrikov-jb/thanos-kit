@@ -190,6 +190,58 @@ func summarize(t *testing.T, outDir string, ids []ulid.ULID) map[string]*tenantS
 	return out
 }
 
+// blockSymbols returns a block's on-disk symbol table (already sorted).
+func blockSymbols(t *testing.T, bdir string) []string {
+	t.Helper()
+	b, err := tsdb.OpenBlock(log.NewNopLogger(), bdir, nil)
+	if err != nil {
+		t.Fatalf("open block %s: %v", bdir, err)
+	}
+	defer b.Close()
+	ir, err := b.Index()
+	if err != nil {
+		t.Fatalf("index %s: %v", bdir, err)
+	}
+	defer ir.Close()
+	var syms []string
+	it := ir.Symbols()
+	for it.Next() {
+		syms = append(syms, strings.Clone(it.At())) // At() aliases the mmap freed at b.Close()
+	}
+	if err := it.Err(); err != nil {
+		t.Fatalf("symbols %s: %v", bdir, err)
+	}
+	return syms
+}
+
+// referencedStrings returns every label name and value used by the block's series.
+func referencedStrings(t *testing.T, bdir string) map[string]struct{} {
+	t.Helper()
+	b, err := tsdb.OpenBlock(log.NewNopLogger(), bdir, nil)
+	if err != nil {
+		t.Fatalf("open block %s: %v", bdir, err)
+	}
+	defer b.Close()
+	bq, err := tsdb.NewBlockQuerier(b, math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("querier %s: %v", bdir, err)
+	}
+	defer bq.Close()
+	ref := map[string]struct{}{}
+	ss := bq.Select(false, nil, matchAllTest)
+	for ss.Next() {
+		for _, l := range ss.At().Labels() {
+			// Labels alias the mmap freed at b.Close(); clone before storing.
+			ref[strings.Clone(l.Name)] = struct{}{}
+			ref[strings.Clone(l.Value)] = struct{}{}
+		}
+	}
+	if err := ss.Err(); err != nil {
+		t.Fatalf("select %s: %v", bdir, err)
+	}
+	return ref
+}
+
 // extKey is the canonical string of a block's ext-labels (thanos labels minus "src").
 func extKey(thanos map[string]string) string {
 	m := map[string]string{}
@@ -425,6 +477,24 @@ func TestStreamMatchesHead(t *testing.T) {
 	if n := len(drainSeries(t, streamOut, streamIDs, `{prometheus="D"}`, `{__name__="disk"}`)); n != 6000 {
 		t.Errorf("stream D samples = %d want 6000", n)
 	}
+
+	// Symbol-table check: --stream must prune each output block's symbol table to
+	// the strings its series reference, not inherit the whole source symbol set
+	// (thanos-compact unions input symbols and never prunes, so foreign strings
+	// would bake into long-lived compacted blocks). Assert no unreferenced symbol
+	// survives in any stream block.
+	for _, id := range streamIDs {
+		bdir := path.Join(streamOut, id.String())
+		ref := referencedStrings(t, bdir)
+		for _, s := range blockSymbols(t, bdir) {
+			if s == "" {
+				continue
+			}
+			if _, ok := ref[s]; !ok {
+				t.Errorf("stream block %s carries unreferenced symbol %q: symbol table not pruned", id, s)
+			}
+		}
+	}
 }
 
 // TestUnwrapBlockE2E covers unwrapBlock orchestration around splitBlock: the
@@ -432,17 +502,6 @@ func TestStreamMatchesHead(t *testing.T) {
 // zero-output-block delete, and the meta-relabel whole-block drop.
 func TestUnwrapBlockE2E(t *testing.T) {
 	logger := log.NewNopLogger()
-	// unwrapBlock mutates TMPDIR process-wide, and t.TempDir() derives from it;
-	// restore it after each subtest so sibling subtests get a valid base dir.
-	origTMPDIR, hadTMPDIR := os.LookupEnv("TMPDIR")
-	restore := func() {
-		if hadTMPDIR {
-			os.Setenv("TMPDIR", origTMPDIR)
-		} else {
-			os.Unsetenv("TMPDIR")
-		}
-	}
-	defer restore()
 
 	setupSrc := func(t *testing.T) (objstore.Bucket, ulid.ULID, string) {
 		bktDir := t.TempDir()
@@ -489,7 +548,6 @@ func TestUnwrapBlockE2E(t *testing.T) {
 	}
 
 	t.Run("non-dry-run uploads per-tenant blocks and deletes source", func(t *testing.T) {
-		defer restore()
 		src, id, srcDir := setupSrc(t)
 		dst, dstDir := dstBucket(t)
 		if err := unwrapBlock(src, Block{Id: id}, testRelabel(t), nil, t.TempDir(), false, dst, 1, false, logger); err != nil {
@@ -504,7 +562,6 @@ func TestUnwrapBlockE2E(t *testing.T) {
 	})
 
 	t.Run("dry-run uploads and deletes nothing", func(t *testing.T) {
-		defer restore()
 		src, id, srcDir := setupSrc(t)
 		dst, dstDir := dstBucket(t)
 		if err := unwrapBlock(src, Block{Id: id}, testRelabel(t), nil, t.TempDir(), true, dst, 1, false, logger); err != nil {
@@ -519,7 +576,6 @@ func TestUnwrapBlockE2E(t *testing.T) {
 	})
 
 	t.Run("zero output blocks still deletes source", func(t *testing.T) {
-		defer restore()
 		src, id, srcDir := setupSrc(t)
 		dst, dstDir := dstBucket(t)
 		dropAll := mustRelabel(t, "- source_labels: [__name__]\n  regex: \".*\"\n  action: drop\n")
@@ -535,7 +591,6 @@ func TestUnwrapBlockE2E(t *testing.T) {
 	})
 
 	t.Run("meta-relabel whole-block drop keeps source", func(t *testing.T) {
-		defer restore()
 		src, id, srcDir := setupSrc(t)
 		dst, dstDir := dstBucket(t)
 		// meta-relabel that drops the block: keep only blocks whose src label matches

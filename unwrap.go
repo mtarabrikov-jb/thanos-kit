@@ -105,18 +105,6 @@ func unwrapBlock(bkt objstore.Bucket, b Block, relabelConfig []*relabel.Config, 
 	inDir := path.Join(dir, "in")
 	outDir := path.Join(dir, "out")
 
-	// Head chunks written by tsdb.NewBlockWriter are m-mapped under os.TempDir().
-	// On tmpfs (common in containers) that makes them RAM-backed and unreclaimable,
-	// which collapses the per-tenant memory bound. Pin TMPDIR to the --data-dir
-	// volume (expected to be real disk) so m-mapped chunks stay reclaimable.
-	tmpDir := path.Join(dir, "tmp")
-	if err := os.MkdirAll(tmpDir, 0777); err != nil {
-		return fmt.Errorf("create temp dir %s: %w", tmpDir, err)
-	}
-	if err := os.Setenv("TMPDIR", tmpDir); err != nil {
-		return err
-	}
-
 	// prepare input
 	ctxd, canceld := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer canceld()
@@ -233,7 +221,7 @@ func extractLabels(ls labels.Labels, names []string) (res labels.Labels, el labe
 
 // blockTenant is one open output block writer while its batch is being filled.
 type blockTenant struct {
-	writer  *noIsoWriter
+	writer  *tsdb.BlockWriter
 	app     storage.Appender
 	ext     labels.Labels // this tenant's ext-labels, written into meta.json
 	samples int           // uncommitted samples in the current appender
@@ -314,7 +302,7 @@ func splitBlock(ctx context.Context, q storage.Querier, relabelConfig []*relabel
 		// Open one block writer per tenant in this batch.
 		writers := make(map[string]*blockTenant, end-start)
 		for _, key := range order[start:end] {
-			w, werr := newNoIsoWriter(logger, outDir, blockSize)
+			w, werr := tsdb.NewBlockWriter(logger, outDir, blockSize)
 			if werr != nil {
 				return nil, werr
 			}

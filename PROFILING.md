@@ -108,11 +108,13 @@ source block, not heap - check `HeapSys` in `memstats-peak.txt` (or the bench
 - `inuse_space` (in the pprof profile) is the **live** heap after a GC -- the
   retained working set. `HeapInuse` / `HeapSys` in `memstats-peak.txt` are
   measured before that GC and include collectable garbage; the difference is GC
-  headroom, which `--memory-limit` / `GOMEMLIMIT` reduce.
+  headroom, which `GOMEMLIMIT` reduces.
 - `WriteHeapProfile` forces a GC, so the profile reflects retained objects. The
   sampler re-profiles on each new `HeapInuse` peak to land near the true peak.
 - m-mapped Head chunk files are file-backed (not in the heap profile and not in
-  anonymous memory) as long as `TMPDIR` points at real disk, not tmpfs.
+  anonymous memory) as long as `os.TempDir()` (`$TMPDIR`, where the Head writes
+  them) is real disk, not tmpfs. The tool no longer pins `TMPDIR`; export it
+  yourself if `/tmp` is tmpfs.
 
 ## Clean up
 

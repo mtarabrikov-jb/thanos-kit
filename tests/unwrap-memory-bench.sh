@@ -37,6 +37,7 @@
 #   SPLIT='a;b'          ext-label names for __meta_ext_labels (default: auto)
 #   MEM=8G               MemoryMax per run
 #   KS='1 4 0'           --max-open-blocks values to sweep for the new binary
+#   STREAM=1             also run a --stream (no-Head) pass; ignores --max-open-blocks
 #   TIMEOUT=900          per-run wall-clock safety limit (seconds)
 #   BASELINE_REF=master  git ref to build the baseline binary from
 #   WORK=/tmp/tk-bench   scratch dir for binaries, data-dirs, outputs
@@ -141,6 +142,7 @@ printf -- '- target_label: __meta_ext_labels\n  replacement: %s\n' "$SPLIT" > "$
 echo ">> plan:   (each: --dry-run, cap $MEM, timeout ${TIMEOUT}s)"
 echo "             old-unbounded   tk-old unwrap (no --max-open-blocks)"
 for k in $KS; do echo "             new-k$k          tk-new unwrap --max-open-blocks=$k"; done
+[ -n "${STREAM:-}" ] && echo "             new-stream       tk-new unwrap --stream (no Head; ignores --max-open-blocks)"
 if [ -n "${SKIP_RUNS:-}" ]; then echo ">> SKIP_RUNS set; not running benches"; exit 0; fi
 
 # --- run one bench: run <tag> <old|new> [extra unwrap args...] ---------------
@@ -217,6 +219,7 @@ PY
 # --- drive -------------------------------------------------------------------
 run "old-unbounded" old
 for k in $KS; do run "new-k$k" new --max-open-blocks="$k"; done
+[ -n "${STREAM:-}" ] && run "new-stream" new --stream
 
 # --- summary -----------------------------------------------------------------
 echo
