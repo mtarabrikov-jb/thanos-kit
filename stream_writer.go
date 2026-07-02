@@ -26,11 +26,13 @@ import (
 // streams one series' chunks at a time and copies chunks by reference - so peak
 // memory is O(largest single series + the tenant's series refs), not O(tenant).
 // Chunk refs, postings, meta.json, tombstone application and the atomic write are
-// all done by the (battle-tested) compactor; we only filter and relabel.
+// all done by the (battle-tested) compactor; we filter, relabel, and prune the
+// symbol table to this tenant's referenced strings (see tenantIndexReader.Symbols).
 type tenantBlockReader struct {
-	src  *tsdb.Block
-	refs []storage.SeriesRef                       // this tenant's series, in source (sorted) order
-	keep func(labels.Labels) (labels.Labels, bool) // relabel + ext-strip, applied per series
+	src     *tsdb.Block
+	refs    []storage.SeriesRef                       // this tenant's series, in source (sorted) order
+	keep    func(labels.Labels) (labels.Labels, bool) // relabel + ext-strip, applied per series
+	symbols []string                                  // sorted, deduped strings referenced by this tenant's output series
 }
 
 func (r *tenantBlockReader) Index() (tsdb.IndexReader, error) {
@@ -38,7 +40,7 @@ func (r *tenantBlockReader) Index() (tsdb.IndexReader, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &tenantIndexReader{IndexReader: ir, refs: r.refs, keep: r.keep}, nil
+	return &tenantIndexReader{IndexReader: ir, refs: r.refs, keep: r.keep, symbols: r.symbols}, nil
 }
 func (r *tenantBlockReader) Chunks() (tsdb.ChunkReader, error)      { return r.src.Chunks() }
 func (r *tenantBlockReader) Tombstones() (tombstones.Reader, error) { return r.src.Tombstones() }
@@ -47,9 +49,20 @@ func (r *tenantBlockReader) Size() int64                            { return r.s
 
 type tenantIndexReader struct {
 	tsdb.IndexReader
-	refs []storage.SeriesRef
-	keep func(labels.Labels) (labels.Labels, bool)
+	refs    []storage.SeriesRef
+	keep    func(labels.Labels) (labels.Labels, bool)
+	symbols []string
 }
+
+// Symbols returns only the strings referenced by this tenant's output series,
+// overriding the embedded reader's whole-block symbol table. Without it the
+// compactor writes the union of the input block's Symbols() into every tenant
+// block (populateBlock adds them verbatim, it does not prune to the labels it
+// actually writes), so each output block would inherit all other tenants' label
+// values, the ext-label values and dropped __ labels - and thanos-compact never
+// cleans them up (it unions input symbols too), baking the bloat into long-lived
+// compacted blocks. This makes --stream match what the Head path emits.
+func (t *tenantIndexReader) Symbols() index.StringIter { return index.NewStringListIter(t.symbols) }
 
 // Postings ignores the matcher and returns this tenant's series; on a single
 // block the compactor only asks for AllPostingsKey.
@@ -126,6 +139,7 @@ func streamSplitBlock(ctx context.Context, src *tsdb.Block, relabelConfig []*rel
 	type tenant struct {
 		refs []storage.SeriesRef
 		ext  labels.Labels
+		syms map[string]struct{} // distinct strings referenced by this tenant's output labels
 	}
 	tenants := map[string]*tenant{}
 	var order []string
@@ -135,17 +149,23 @@ func streamSplitBlock(ctx context.Context, src *tsdb.Block, relabelConfig []*rel
 		if err := ir.Series(all.At(), &builder, &chks); err != nil {
 			return nil, err
 		}
-		key, ext, _, keep := route(builder.Labels())
+		key, ext, out, keep := route(builder.Labels())
 		if !keep {
 			continue
 		}
 		t := tenants[key]
 		if t == nil {
-			t = &tenant{ext: ext}
+			t = &tenant{ext: ext, syms: map[string]struct{}{}}
 			tenants[key] = t
 			order = append(order, key)
 		}
 		t.refs = append(t.refs, all.At())
+		// Collect the symbols this tenant's output block will reference, so its
+		// Symbols() can be pruned to them (source strings are stable while src is open).
+		for _, l := range out {
+			t.syms[l.Name] = struct{}{}
+			t.syms[l.Value] = struct{}{}
+		}
 	}
 	if err := all.Err(); err != nil {
 		return nil, err
@@ -166,7 +186,12 @@ func streamSplitBlock(ctx context.Context, src *tsdb.Block, relabelConfig []*rel
 	extOf := map[ulid.ULID]labels.Labels{}
 	for _, key := range order {
 		t := tenants[key]
-		reader := &tenantBlockReader{src: src, refs: t.refs, keep: keep}
+		syms := make([]string, 0, len(t.syms))
+		for s := range t.syms {
+			syms = append(syms, s)
+		}
+		slices.Sort(syms)
+		reader := &tenantBlockReader{src: src, refs: t.refs, keep: keep, symbols: syms}
 		id, werr := compactor.Write(outDir, reader, srcMeta.MinTime, srcMeta.MaxTime+1, nil)
 		if werr != nil {
 			return nil, fmt.Errorf("write tenant %s: %w", key, werr)
