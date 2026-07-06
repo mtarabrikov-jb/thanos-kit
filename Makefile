@@ -6,6 +6,21 @@ help: ## Displays help
 test: ## Run unit tests
 	@go test ./...
 
+fmt: ## Format Go code with gofmt
+	@gofmt -w .
+
+vet: ## Run go vet
+	@go vet ./...
+
+lint: ## Check gofmt formatting and run go vet
+	@echo ">> checking gofmt"
+	@out=`gofmt -l .`; if [ -n "$$out" ]; then echo "not gofmt-ed:"; echo "$$out"; exit 1; fi
+	@echo ">> running go vet"
+	@go vet ./...
+
+check: lint ## Run lint then tests with race detector
+	@go test -race ./...
+
 build: ## Build binaries with version set
 	@CGO_ENABLED=0 go build -ldflags "-w -s \
 	-X github.com/prometheus/common/version.Version=${VER} \
